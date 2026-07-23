@@ -1,210 +1,247 @@
 import asyncio
-import requests
+import aiohttp
+import logging
+import os
+import time
+import threading
+from bottle import Bottle, run
 import pandas as pd
 import numpy as np
 
-# ==================== НАСТРОЙКИ ====================
-TELEGRAM_BOT_TOKEN = "ТВОЙ_ТЕЛЕГРАМ_ТОКЕН"
-TELEGRAM_CHAT_ID = "ТВОЙ_CHAT_ID"
+# ==================== МАСКИРОВОЧНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
+web_app = Bottle()
 
-TIMEFRAMES = ['5m', '15m', '30m'] # Таймфреймы для отслеживания
-LIMIT_CANDLES = 100               # Сколько свечей загружать
-SWING_WINDOW = 3                  # Чувствительность фракталов (3 свечи слева и справа)
-SLIPPAGE_PCT = 0.003             # Допуск на подход к зоне (0.3%)
-# =====================================================
+@web_app.route('/')
+def home():
+    return "Bot is running 24/7!"
 
-def send_telegram(message):
+def run_web_server():
+    port = int(os.getenv("PORT", 8080))
+    run(web_app, host='0.0.0.0', port=port, quiet=True)
+
+# Запускаем веб-сервер в фоновом потоке
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# ==================== НАСТРОЙКИ (ENV RENDER) ====================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+TIMEFRAMES = ['5m', '15m', '30m']
+LIMIT_CANDLES = 80
+SWING_WINDOW = 3
+SLIPPAGE_PCT = 0.003
+MIN_RR_RATIO = 2.0
+
+SIGNAL_COOLDOWN_HOURS = 4
+MAX_SIGNALS_PER_SCAN = 5
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class SignalTracker:
+    def __init__(self, cooldown_hours=4):
+        self.signals = {}
+        self.cooldown = cooldown_hours * 3600
+    
+    def can_send(self, key):
+        current_time = time.time()
+        if key in self.signals:
+            if current_time - self.signals[key] < self.cooldown:
+                return False
+        return True
+    
+    def mark_sent(self, key):
+        self.signals[key] = time.time()
+    
+    def cleanup(self):
+        current_time = time.time()
+        expired = [k for k, t in self.signals.items() if current_time - t > self.cooldown * 2]
+        for k in expired:
+            del self.signals[k]
+
+async def send_telegram(session, message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы!")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, data=data, timeout=5)
+        async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            return resp.status == 200
     except Exception as e:
-        print(f"Ошибка отправки в ТГ: {e}")
+        logger.error(f"Ошибка отправки в Telegram: {e}")
+        return False
 
-def get_futures_symbols():
-    """Получаем список всех бессрочных фьючерсов USDT с BingX"""
+async def get_futures_symbols(session):
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
     try:
-        url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
-        res = requests.get(url, timeout=10).json()
-        symbols = [item['symbol'] for item in res['data'] if item['symbol'].endswith('-USDT')]
-        return symbols
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("code") == 0 and "data" in data:
+                    return [item['symbol'] for item in data['data'] if item.get('symbol', '').endswith('-USDT') and item.get('status') == 1]
     except Exception as e:
-        print(f"Ошибка получения списка монет: {e}")
-        return []
+        logger.error(f"Ошибка получения списка монет: {e}")
+    return []
 
-def get_klines(symbol, interval):
-    """Загрузка свечей"""
+async def get_klines(session, symbol, interval):
+    url = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": LIMIT_CANDLES}
     try:
-        url = f"https://open-api.bingx.com/openApi/swap/v3/quote/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": LIMIT_CANDLES}
-        res = requests.get(url, params=params, timeout=5).json()
-        
-        if 'data' not in res or not res['data']:
-            return None
-            
-        df = pd.DataFrame(res['data'])
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['close'] = df['close'].astype(float)
-        df['open'] = df['open'].astype(float)
-        return df
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                res = await resp.json()
+                if res.get("code") == 0 and "data" in res and len(res["data"]) >= 40:
+                    df = pd.DataFrame(res['data'])
+                    df['high'] = df['high'].astype(float)
+                    df['low'] = df['low'].astype(float)
+                    df['close'] = df['close'].astype(float)
+                    df['open'] = df['open'].astype(float)
+                    return df
     except Exception:
-        return None
+        pass
+    return None
 
 def find_swings(df, window=SWING_WINDOW):
-    """Поиск локальных пиков (Highs) и доньев (Lows)"""
-    highs = []
-    lows = []
-    
+    highs, lows = [], []
     for i in range(window, len(df) - window):
-        # Swing High
-        if all(df['high'].iloc[i] > df['high'].iloc[i-j] for j in range(1, window+1)) and \
-           all(df['high'].iloc[i] > df['high'].iloc[i+j] for j in range(1, window+1)):
-            highs.append((i, df['high'].iloc[i]))
-            
-        # Swing Low
-        if all(df['low'].iloc[i] < df['low'].iloc[i-j] for j in range(1, window+1)) and \
-           all(df['low'].iloc[i] < df['low'].iloc[i+j] for j in range(1, window+1)):
-            lows.append((i, df['low'].iloc[i]))
-            
+        current_high, current_low = df['high'].iloc[i], df['low'].iloc[i]
+        if all(current_high > df['high'].iloc[i - j] for j in range(1, window + 1)) and \
+           all(current_high > df['high'].iloc[i + j] for j in range(1, window + 1)):
+            if not highs or (i - highs[-1][0] > 3):
+                highs.append((i, current_high))
+        if all(current_low < df['low'].iloc[i - j] for j in range(1, window + 1)) and \
+           all(current_low < df['low'].iloc[i + j] for j in range(1, window + 1)):
+            if not lows or (i - lows[-1][0] > 3):
+                lows.append((i, current_low))
     return highs, lows
 
 def detect_bullish_qm(df):
-    """Поиск Бычьего Квазимодо (Лонг)"""
     highs, lows = find_swings(df)
-    
-    if len(highs) < 2 or len(lows) < 2:
-        return None
+    if len(highs) < 2 or len(lows) < 2: return None
+    h1_idx, h1_val = highs[-2]
+    h2_idx, h2_val = highs[-1]
+    l1_idx, l1_val = lows[-2]
+    l2_idx, l2_val = lows[-1]
 
-    # Берем последние экстремумы
-    h1_idx, h1_val = highs[-2]  # Левое плечо (High 1)
-    h2_idx, h2_val = highs[-1]  # Слом структуры / MSB (High 2)
-    
-    l1_idx, l1_val = lows[-2]   # Low 1
-    l2_idx, l2_val = lows[-1]   # Голова / Head (Low 2)
+    if not (h1_idx < l2_idx < h2_idx) or not (l2_val < l1_val) or not (h2_val > h1_val): return None
+    if h2_idx - l2_idx > 20: return None
 
-    # Правильная последовательность во времени: H1 -> L2 (Head) -> H2 (MSB)
-    if not (h1_idx < l2_idx < h2_idx):
-        return None
+    current_price = df['close'].iloc[-1]
+    target_zone_low, target_zone_high = h1_val * (1 - SLIPPAGE_PCT), h1_val * (1 + SLIPPAGE_PCT)
+    if not ((target_zone_low <= current_price <= target_zone_high) or (l2_val < current_price <= h1_val)): return None
 
-    # Условия Бычьего QM:
-    # 1. Голова ниже предыдущего лоу (L2 < L1)
-    # 2. Пробой левого плеча вверх (H2 > H1) - MSB / ChoCh
-    if l2_val < l1_val and h2_val > h1_val:
-        current_price = df['close'].iloc[-1]
-        
-        # Проверяем, что цена откатилась обратно в зону Левого Плеча (H1)
-        target_zone_low = h1_val * (1 - SLIPPAGE_PCT)
-        target_zone_high = h1_val * (1 + SLIPPAGE_PCT)
-        
-        if target_zone_low <= current_price <= target_zone_high or (current_price > l2_val and current_price <= h1_val):
-            stop_loss = l2_val
-            take_profit = h2_val
-            
-            risk = current_price - stop_loss
-            reward = take_profit - current_price
-            
-            if risk > 0 and reward / risk >= 2.0: # Потенциал RR не менее 1:2
-                rr_ratio = round(reward / risk, 2)
-                return {
-                    "type": "LONG 🟢 (Bullish QM)",
-                    "entry": current_price,
-                    "shoulder": h1_val,
-                    "stop": stop_loss,
-                    "take": take_profit,
-                    "rr": rr_ratio
-                }
-    return None
+    stop_loss = l2_val * 0.998
+    take_profit = h2_val * 1.002
+    risk, reward = current_price - stop_loss, take_profit - current_price
+    if risk <= 0: return None
+
+    rr_ratio = round(reward / risk, 2)
+    if rr_ratio < MIN_RR_RATIO: return None
+
+    return {
+        "type": "LONG 🟢", "pattern": "Bullish Quasimodo", "entry": current_price,
+        "shoulder": h1_val, "stop": stop_loss, "take": take_profit, "rr": rr_ratio,
+        "risk_pct": round((risk / current_price) * 100, 2)
+    }
 
 def detect_bearish_qm(df):
-    """Поиск Медвежьего Квазимодо (Шорт)"""
     highs, lows = find_swings(df)
-    
-    if len(highs) < 2 or len(lows) < 2:
-        return None
+    if len(highs) < 2 or len(lows) < 2: return None
+    l1_idx, l1_val = lows[-2]
+    l2_idx, l2_val = lows[-1]
+    h1_idx, h1_val = highs[-2]
+    h2_idx, h2_val = highs[-1]
 
-    l1_idx, l1_val = lows[-2]   # Левое плечо (Low 1)
-    l2_idx, l2_val = lows[-1]   # Слом структуры (Low 2)
-    
-    h1_idx, h1_val = highs[-2]  # High 1
-    h2_idx, h2_val = highs[-1]  # Голова (High 2)
+    if not (l1_idx < h2_idx < l2_idx) or not (h2_val > h1_val) or not (l2_val < l1_val): return None
+    if l2_idx - h2_idx > 20: return None
 
-    if not (l1_idx < h2_idx < l2_idx):
-        return None
+    current_price = df['close'].iloc[-1]
+    target_zone_low, target_zone_high = l1_val * (1 - SLIPPAGE_PCT), l1_val * (1 + SLIPPAGE_PCT)
+    if not ((target_zone_low <= current_price <= target_zone_high) or (l1_val <= current_price < h2_val)): return None
 
-    # Условия Медвежьего QM:
-    # 1. Голова выше предыдущего хая (H2 > H1)
-    # 2. Пробой левого плеча вниз (L2 < L1)
-    if h2_val > h1_val and l2_val < l1_val:
-        current_price = df['close'].iloc[-1]
-        
-        target_zone_low = l1_val * (1 - SLIPPAGE_PCT)
-        target_zone_high = l1_val * (1 + SLIPPAGE_PCT)
-        
-        if target_zone_low <= current_price <= target_zone_high or (current_price < h2_val and current_price >= l1_val):
-            stop_loss = h2_val
-            take_profit = l2_val
-            
-            risk = stop_loss - current_price
-            reward = current_price - take_profit
-            
-            if risk > 0 and reward / risk >= 2.0:
-                rr_ratio = round(reward / risk, 2)
-                return {
-                    "type": "SHORT 🔴 (Bearish QM)",
-                    "entry": current_price,
-                    "shoulder": l1_val,
-                    "stop": stop_loss,
-                    "take": take_profit,
-                    "rr": rr_ratio
-                }
-    return None
+    stop_loss = h2_val * 1.002
+    take_profit = l2_val * 0.998
+    risk, reward = stop_loss - current_price, current_price - take_profit
+    if risk <= 0: return None
+
+    rr_ratio = round(reward / risk, 2)
+    if rr_ratio < MIN_RR_RATIO: return None
+
+    return {
+        "type": "SHORT 🔴", "pattern": "Bearish Quasimodo", "entry": current_price,
+        "shoulder": l1_val, "stop": stop_loss, "take": take_profit, "rr": rr_ratio,
+        "risk_pct": round((risk / current_price) * 100, 2)
+    }
+
+def format_price(price):
+    if price >= 100: return f"{price:.2f}"
+    elif price >= 1: return f"{price:.4f}"
+    elif price >= 0.001: return f"{price:.6f}"
+    else: return f"{price:.8f}"
 
 async def scan_market():
-    print("🚀 Скрипт Quasimodo запущен и сканирует рынок...")
-    send_telegram("🤖 <b>Бот Quasimodo (QM) запущен!</b>\nОтслеживаю таймфреймы: 5m, 15m, 30m.")
-    
-    # Кэш, чтобы не спамить об одной и той же монете
-    sent_signals = set()
+    logger.info("🚀 Сканер Квазимодо запущен")
+    connector = aiohttp.TCPConnector(limit=10)
+    tracker = SignalTracker(cooldown_hours=SIGNAL_COOLDOWN_HOURS)
 
-    while True:
-        symbols = get_futures_symbols()
-        print(f"Сканирую {len(symbols)} монет...")
+    async with aiohttp.ClientSession(connector=connector) as session:
+        await send_telegram(
+            session,
+            "🤖 <b>Бот Quasimodo запущен на Render (Free Web Service)!</b>\n"
+            f"📊 TF: {', '.join(TIMEFRAMES)} | RR >= 1:{MIN_RR_RATIO}"
+        )
 
-        for symbol in symbols:
-            clean_symbol = symbol.replace('-USDT', 'USDT')
+        scan_counter = 0
+        while True:
+            try:
+                scan_counter += 1
+                if scan_counter % 20 == 0: tracker.cleanup()
 
-            for tf in TIMEFRAMES:
-                df = get_klines(symbol, tf)
-                if df is None or len(df) < 50:
+                symbols = await get_futures_symbols(session)
+                if not symbols:
+                    await asyncio.sleep(30)
                     continue
 
-                signal = detect_bullish_qm(df) or detect_bearish_qm(df)
-                
-                if signal:
-                    signal_key = f"{clean_symbol}_{tf}_{signal['type']}"
-                    
-                    if signal_key not in sent_signals:
-                        msg = (
-                            f"🎯 <b>ПАТТЕРН КВАЗИМОДО FOUND!</b>\n\n"
-                            f"📌 <b>Монета:</b> #{clean_symbol}\n"
-                            f"⏱ <b>Таймфрейм:</b> {tf}\n"
-                            f"Сигнал: <b>{signal['type']}</b>\n\n"
-                            f"📥 <b>Вход (Тест плеча):</b> <code>{signal['entry']:.6f}</code>\n"
-                            f"🛡 <b>Стоп-лосс (Голова):</b> <code>{signal['stop']:.6f}</code>\n"
-                            f"🎯 <b>Тейк-профит (Перехай):</b> <code>{signal['take']:.6f}</code>\n"
-                            f"⚖️ <b>Соотношение R:R:</b> 1:{signal['rr']}"
-                        )
-                        send_telegram(msg)
-                        sent_signals.add(signal_key)
+                signals_found = 0
+                for symbol in symbols:
+                    clean_symbol = symbol.replace('-USDT', 'USDT')
 
-            await asyncio.sleep(0.1) # Задержка от бана API
-            
-        # Очищаем кэш сигналов каждый час
-        if len(sent_signals) > 100:
-            sent_signals.clear()
+                    for tf in TIMEFRAMES:
+                        signal_key = f"{clean_symbol}_{tf}"
+                        if not tracker.can_send(signal_key): continue
 
-        await asyncio.sleep(30) # Пауза между кругами
+                        df = await get_klines(session, symbol, tf)
+                        if df is None: continue
+
+                        signal = detect_bullish_qm(df) or detect_bearish_qm(df)
+                        if signal:
+                            signals_found += 1
+                            if signals_found > MAX_SIGNALS_PER_SCAN: break
+
+                            msg = (
+                                f"🎯 <b>ПАТТЕРН КВАЗИМОДО!</b>\n\n"
+                                f"📌 <b>Монета:</b> #{clean_symbol}\n"
+                                f"⏱ <b>Таймфрейм:</b> {tf}\n"
+                                f"📊 <b>Тип:</b> {signal['type']}\n\n"
+                                f"📥 <b>Вход:</b> <code>{format_price(signal['entry'])}</code>\n"
+                                f"🎯 <b>Тейк:</b> <code>{format_price(signal['take'])}</code>\n"
+                                f"🛑 <b>Стоп:</b> <code>{format_price(signal['stop'])}</code>\n"
+                                f"⚖️ <b>R:R:</b> 1:{signal['rr']} ({signal['risk_pct']}%)"
+                            )
+
+                            if await send_telegram(session, msg):
+                                tracker.mark_sent(signal_key)
+
+                    await asyncio.sleep(0.05)
+                    if signals_found > MAX_SIGNALS_PER_SCAN: break
+
+                await asyncio.sleep(30)
+
+            except asyncio.CancelledError: break
+            except Exception as e:
+                logger.error(f"Ошибка цикла: {e}")
+                await asyncio.sleep(30)
 
 if __name__ == "__main__":
     asyncio.run(scan_market())
