@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ОБЩИЕ ФИЛЬТРЫ
 # -------------------------------------------------------------
 
-MIN_24H_VOLUME_USDT = 2_000_000
+MIN_24H_VOLUME_USDT = 1_000_000
 
 EXCLUDED_SYMBOLS = {
     "USDC",
