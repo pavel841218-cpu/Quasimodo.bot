@@ -775,18 +775,36 @@ async def scanner_loop():
 async def handle_ping(request):
     return web.Response(text="ConsolidationHunter v2 Active", status=200)
 
-async def main():
+async def start_background_tasks(app):
+    """
+    Запускает сканер как фоновую задачу (Background Task)
+    при старте веб-сервера.
+    """
+    app['scanner_task'] = asyncio.create_task(scanner_loop())
+
+async def cleanup_background_tasks(app):
+    """
+    Корректно отменяет задачу сканера при остановке сервера.
+    """
+    app['scanner_task'].cancel()
+    await app['scanner_task']
+
+def main():
     app = web.Application()
+    # Эндпоинты для UptimeRobot и проверку здоровья Render
     app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    app.router.add_get("/health", handle_ping)
+    
+    # Регистрация фонового сканера
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
+
     port = int(os.environ.get("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    await scanner_loop()
+    web.run_app(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
+        main()
+    except (KeyboardInterrupt, SystemExit):
         logger.info("🛑 Остановлено")
+
